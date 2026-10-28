@@ -1,0 +1,30 @@
+# Environment variables / secrets
+.env
+
+# Python virtual environment
+.venv/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Generated datasets / temporary files
+data/work/
+data/upload_test/
+data/download_test/
+data/processed/
+
+# Generated ML artifacts
+artifacts/
+
+# Local executables
+tools/mc/mc.exe
+tools/nuctl/nuctl.exe
+
+# IDE / OS
+.vscode/
+.DS_Store
+Thumbs.db

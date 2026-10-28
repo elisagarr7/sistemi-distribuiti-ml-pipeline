@@ -1,0 +1,62 @@
+services:
+  minio:
+    build:
+      context: ./infra/minio
+      dockerfile: Dockerfile
+      args:
+        MINIO_VERSION: RELEASE.2025-10-15T17-29-55Z
+        MINIO_COMMIT: 9e49d5e
+
+
+    image: sdcc-minio:RELEASE.2025-10-15T17-29-55Z
+    container_name: sdcc-minio
+
+    command: server /data --console-address ":9001"
+
+    ports:
+      - "127.0.0.1:19000:9000"
+      - "127.0.0.1:19001:9001"
+
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      
+      MINIO_NOTIFY_WEBHOOK_ENABLE_PREPROCESSING: "on"
+      MINIO_NOTIFY_WEBHOOK_ENDPOINT_PREPROCESSING: "http://nuclio-nuclio-preprocessing-faas:8080"
+
+      MINIO_NOTIFY_WEBHOOK_ENABLE_TRAINING: "on"
+      MINIO_NOTIFY_WEBHOOK_ENDPOINT_TRAINING: "http://nuclio-nuclio-training-faas:8080"
+
+    volumes:
+      - minio_data:/data
+
+    networks:
+      - sdcc-network
+
+    restart: unless-stopped
+
+
+
+  nuclio-dashboard:
+    image: quay.io/nuclio/dashboard:stable-amd64
+    container_name: nuclio-dashboard
+
+    ports:
+      - "127.0.0.1:8070:8070"
+
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./nuclio/platform.yaml:/etc/nuclio/config/platform/platform.yaml:ro
+
+    networks:
+      - sdcc-network
+
+    restart: unless-stopped
+
+volumes:
+  minio_data:
+
+
+networks:
+  sdcc-network:
+    name: sdcc-network

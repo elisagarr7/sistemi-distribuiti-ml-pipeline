@@ -1,0 +1,30 @@
+apiVersion: "nuclio.io/v1"
+kind: NuclioFunction
+
+metadata:
+  name: preprocessing-faas
+  namespace: nuclio
+  labels:
+    nuclio.io/project-name: sdcc-ml-pipeline
+
+spec:
+  description: "Preprocessing automatico del dataset PriceRunner"
+
+  runtime: python:3.12
+  handler: main:handler
+
+  env:
+    - name: MINIO_ENDPOINT
+      value: minio:9000
+
+  platform:
+    attributes:
+      network: sdcc-network
+
+  build:
+    commands:
+      - "python -m pip install pandas==3.0.6 minio==7.2.20"
+
+  triggers:
+    http:
+      kind: http
