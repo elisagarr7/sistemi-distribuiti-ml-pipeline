@@ -28,3 +28,5 @@ spec:
   triggers:
     http:
       kind: http
+      attributes:
+        port: 8085

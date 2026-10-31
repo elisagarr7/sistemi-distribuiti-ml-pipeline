@@ -76,6 +76,14 @@ deploy_function \
     "./functions/inference" \
     "inference-faas"
 
+deploy_function \
+    "./functions/upload" \
+    "upload-faas"
+
+deploy_function \
+    "./functions/status" \
+    "status-faas"
+
 
 echo
 echo "======================================"
