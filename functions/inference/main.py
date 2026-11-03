@@ -10,7 +10,25 @@ from minio import Minio
 
 
 MODELS_BUCKET = "models"
-MODEL_OBJECT = "product_classifier.joblib"
+
+def read_json_object(client, bucket_name, object_name):
+    response = None
+
+    try:
+        response = client.get_object(
+            bucket_name,
+            object_name,
+        )
+
+        content = response.read().decode("utf-8")
+
+        return json.loads(content)
+
+    finally:
+        if response is not None:
+            response.close()
+            response.release_conn()
+
 
 
 def get_minio_client():
@@ -72,23 +90,49 @@ def load_model():
 
     client = get_minio_client()
 
-    response = client.get_object(
+    current_model = read_json_object(
+        client,
         MODELS_BUCKET,
-        MODEL_OBJECT
+        "current.json"
     )
 
+    model_version = current_model.get(
+        "active_version"
+    )
+
+    algorithm = current_model.get(
+        "algorithm"
+    )
+
+    model_object = current_model.get(
+        "model_object"
+    )
+
+    if not model_version or not model_object:
+        raise ValueError(
+            "Informazioni del modello attivo non valide"
+        )
+
+    model_response = None
+
     try:
-        model_bytes = response.read()
+        model_response = client.get_object(
+            "models",
+            model_object,
+        )
+
+        model_bytes = model_response.read()
 
     finally:
-        response.close()
-        response.release_conn()
+        if model_response is not None:
+            model_response.close()
+            model_response.release_conn()
 
     model = joblib.load(
         io.BytesIO(model_bytes)
     )
 
-    return model
+    return model, model_version, algorithm
 
 
 def handler(
@@ -141,7 +185,7 @@ def handler(
             product_title=normalized_title
         )
 
-        model = load_model()
+        model, model_version, algorithm = load_model()
 
         predicted_category = model.predict(
             [normalized_title]
@@ -184,7 +228,9 @@ def handler(
                     "predicted_category": (
                         predicted_category
                     ),
-                    "confidence": confidence
+                    "confidence": confidence,
+                    "model_version": model_version,
+                    "algorithm": algorithm,
                 }
             ),
             headers={},

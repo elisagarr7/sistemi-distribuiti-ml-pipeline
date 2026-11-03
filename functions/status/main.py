@@ -12,8 +12,8 @@ PROCESSED_BUCKET = "processed-data"
 PROCESSED_OBJECT = "products_clean.csv"
 
 MODELS_BUCKET = "models"
-MODEL_OBJECT = "product_classifier.joblib"
-METRICS_OBJECT = "training_metrics.json"
+CURRENT_OBJECT = "current.json"
+
 
 
 def json_response(context, body, status_code=200):
@@ -102,17 +102,49 @@ def handler(context, event):
             PROCESSED_OBJECT,
         )
 
-        model_info = get_object_info(
+        current_info = get_object_info(
             client,
             MODELS_BUCKET,
-            MODEL_OBJECT,
+            CURRENT_OBJECT,
         )
 
-        metrics_info = get_object_info(
-            client,
-            MODELS_BUCKET,
-            METRICS_OBJECT,
-        )
+
+        current_model = None
+        model_info = None
+        metrics_info = None
+
+        model_object = None
+        metrics_object = None
+
+        if current_info is not None:
+            current_model = read_json_object(
+                client,
+                MODELS_BUCKET,
+                CURRENT_OBJECT,
+            )
+
+            model_object = current_model.get(
+                "model_object"
+            )
+
+            metrics_object = current_model.get(
+                "metrics_object"
+            )
+
+            if model_object:
+                model_info = get_object_info(
+                    client,
+                    MODELS_BUCKET,
+                    model_object,
+                )
+
+            if metrics_object:
+                metrics_info = get_object_info(
+                    client,
+                    MODELS_BUCKET,
+                    metrics_object,
+                )
+
 
         # -------------------------------
         # Verifica della "freschezza"
@@ -125,15 +157,22 @@ def handler(context, event):
             >= raw_info.last_modified
         )
 
-        model_is_fresh = (
+        current_is_fresh = (
             processed_is_fresh
+            and current_info is not None
+            and current_info.last_modified
+            >= processed_info.last_modified
+        )
+
+        model_is_fresh = (
+            current_is_fresh
             and model_info is not None
             and model_info.last_modified
             >= processed_info.last_modified
         )
 
         metrics_are_fresh = (
-            processed_is_fresh
+            current_is_fresh
             and metrics_info is not None
             and metrics_info.last_modified
             >= processed_info.last_modified
@@ -178,17 +217,35 @@ def handler(context, event):
 
         metrics = None
 
-        if metrics_are_fresh:
+        if metrics_are_fresh and metrics_object:
             metrics = read_json_object(
                 client,
                 MODELS_BUCKET,
-                METRICS_OBJECT,
+                metrics_object,
             )
 
         result = {
             "status": "success",
 
             "pipeline_complete": training_complete,
+
+            "active_model": (
+                {
+                    "version": current_model.get(
+                        "active_version"
+                    ),
+                    "algorithm": current_model.get(
+                        "algorithm"
+                    ),
+                    "created_at": current_model.get(
+                        "created_at"
+                    ),
+                    "model_object": model_object,
+                    "metrics_object": metrics_object,
+                }
+                if current_model
+                else None
+            ),
 
             "stages": {
                 "upload": upload_status,

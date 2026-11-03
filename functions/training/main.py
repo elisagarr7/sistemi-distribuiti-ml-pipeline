@@ -3,6 +3,8 @@ import json
 import os
 from urllib.parse import unquote_plus
 
+from datetime import datetime, timezone
+
 import joblib
 import pandas as pd
 from minio import Minio
@@ -297,6 +299,13 @@ def handler(
         # 3. Training
         model, metrics = train_model(df)
 
+        #  Timestamp e versioning
+        training_time = datetime.now(timezone.utc)
+        version_id = training_time.strftime(
+            "%Y%m%dT%H%M%SZ"
+        )
+        trained_at = training_time.isoformat()
+
         # 4. Serializzazione modello in memoria
         model_buffer = io.BytesIO()
 
@@ -316,11 +325,25 @@ def handler(
             content_type="application/octet-stream"
         )
 
+        metrics["model_version"] = version_id
+        metrics["trained_at"] = trained_at
+        metrics["algorithm"] = "LogisticRegression"
+
         # 6. Serializzazione metriche
         metrics_bytes = json.dumps(
             metrics,
-            indent=4
+            indent=2
         ).encode("utf-8")
+
+        version_model_object = (
+            f"versions/{version_id}/"
+            "product_classifier.joblib"
+        )
+
+        version_metrics_object = (
+            f"versions/{version_id}/"
+            "training_metrics.json"
+        )
 
         # 7. Upload metriche
         client.put_object(
@@ -339,6 +362,55 @@ def handler(
             test_rows=metrics["test_rows"]
         )
 
+        client.put_object(
+            "models",
+            version_model_object,
+            io.BytesIO(model_bytes),
+            length=len(model_bytes),
+            content_type="application/octet-stream",
+        )
+
+        client.put_object(
+            "models",
+            version_metrics_object,
+            io.BytesIO(metrics_bytes),
+            length=len(metrics_bytes),
+            content_type="application/json",
+        )
+
+        # current.json
+        current_model = {
+            "active_version": version_id,
+            "created_at": trained_at,
+            "algorithm": "LogisticRegression",
+            "model_object": version_model_object,
+            "metrics_object": version_metrics_object,
+        }
+
+        # serializzazione in json
+        current_bytes = json.dumps(
+            current_model,
+            indent=2,
+        ).encode("utf-8")
+
+        # upload current.json
+        client.put_object(
+            "models",
+            "current.json",
+            io.BytesIO(current_bytes),
+            length=len(current_bytes),
+            content_type="application/json",
+        )
+
+
+
+        context.logger.info_with(
+            "Model version created",
+            model_version=version_id,
+            algorithm="LogisticRegression",
+            model_object=version_model_object,
+        )
+
         return context.Response(
             body=json.dumps(
                 {
@@ -349,7 +421,7 @@ def handler(
                     ),
                     "model": (
                         f"{models_bucket}/"
-                        f"{model_object}"
+                        f"{version_model_object}"
                     ),
                     "metrics": metrics
                 }
