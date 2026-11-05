@@ -23,13 +23,15 @@ Il dataset originale viene caricato nel bucket MinIO `raw-data`.
 
 Il caricamento genera automaticamente un evento che attiva la funzione di preprocessing. Il dataset elaborato viene quindi salvato nel bucket `processed-data`.
 
-La creazione del dataset processato attiva automaticamente la funzione di training, che addestra il modello e salva modello e metriche nel bucket `models`.
+La creazione del dataset processato attiva automaticamente la funzione di training. Durante questa fase vengono addestrati e confrontati più modelli di classificazione; il modello migliore viene selezionato automaticamente, serializzato e salvato nel bucket `models`.
 
-Sono inoltre disponibili delle funzioni HTTP per:
+Ogni training genera una nuova versione del modello. Il file `current.json` identifica la versione attualmente utilizzata per l'inference.
+
+Sono inoltre disponibili funzioni HTTP per:
 
 - caricare il dataset;
 - controllare lo stato della pipeline;
-- effettuare predizioni utilizzando il modello addestrato.
+- effettuare predizioni utilizzando il modello attivo.
 
 ## Funzioni Nuclio
 
@@ -58,22 +60,52 @@ processed-data/products_clean.csv
 
 Viene attivata automaticamente dopo la creazione del dataset processato.
 
-Il modello utilizza:
+La classificazione utilizza una pipeline basata su:
 
 ```text
 TF-IDF
 +
-Logistic Regression
+selezione automatica del classificatore
 ```
 
-Lo split train/test viene effettuato a livello di `Cluster ID` per evitare che offerte appartenenti allo stesso prodotto siano presenti contemporaneamente nei due insiemi.
-
-Gli output vengono salvati in:
+Vengono confrontati tre algoritmi:
 
 ```text
-models/product_classifier.joblib
-models/training_metrics.json
+Logistic Regression
+Multinomial Naive Bayes
+Linear SVM
 ```
+
+Per `Linear SVM` viene utilizzata una calibrazione delle probabilità, in modo da poter ottenere anche la confidence durante l'inference.
+
+Lo split principale train/test viene effettuato a livello di `Cluster ID`, così da evitare che offerte appartenenti allo stesso prodotto siano presenti contemporaneamente nei due insiemi.
+
+Il train set viene successivamente suddiviso in un insieme utilizzato per addestrare i modelli candidati e un validation set. I tre algoritmi vengono confrontati sul validation set utilizzando come criterio principale il **Macro F1** e, in caso di parità, l'accuracy.
+
+Dopo la selezione, il modello vincitore viene riaddestrato sull'intero train set e valutato una sola volta sul test set.
+
+### Model versioning
+
+Ogni esecuzione del training genera un identificativo di versione basato sul timestamp, ad esempio:
+
+```text
+20261104T042133Z
+```
+
+Gli artefatti sono organizzati nel bucket `models` nel seguente modo:
+
+```text
+models/
+├── current.json
+└── versions/
+    └── <version_id>/
+        ├── product_classifier.joblib
+        └── training_metrics.json
+```
+
+`current.json` contiene il riferimento alla versione attiva, all'algoritmo selezionato e ai relativi file di modello e metriche.
+
+Le versioni precedenti vengono mantenute nel bucket e non vengono sovrascritte.
 
 ### `inference-faas`
 
@@ -87,7 +119,18 @@ La richiesta contiene:
 }
 ```
 
-La risposta contiene la categoria prevista e la confidence associata.
+La risposta contiene:
+
+```text
+categoria prevista
+confidence
+algoritmo utilizzato
+versione del modello
+```
+
+La funzione utilizza `current.json` per individuare il modello attivo.
+
+È inoltre presente una cache in memoria: dopo il primo caricamento, il modello viene riutilizzato nelle successive richieste finché la versione attiva non cambia. Quando un nuovo training aggiorna `current.json`, la cache viene invalidata automaticamente e viene caricato il nuovo modello.
 
 La funzione è esposta localmente sulla porta:
 
@@ -122,8 +165,9 @@ La funzione verifica la presenza e l'aggiornamento di:
 ```text
 raw-data/pricerunner_aggregate.csv
 processed-data/products_clean.csv
-models/product_classifier.joblib
-models/training_metrics.json
+models/current.json
+modello della versione attiva
+metriche della versione attiva
 ```
 
 e restituisce lo stato delle fasi:
@@ -134,7 +178,12 @@ preprocessing
 training
 ```
 
-Restituisce inoltre le metriche del modello quando il training è completato.
+Restituisce inoltre:
+
+- metriche finali del modello;
+- risultati del confronto tra i modelli candidati;
+- algoritmo selezionato;
+- versione attiva.
 
 La funzione è esposta sulla porta:
 
@@ -174,23 +223,41 @@ cluster_id
 category_label
 ```
 
-## Risultati del modello
+## Metriche
 
-Nel test effettuato sono stati ottenuti:
+Le principali metriche utilizzate sono:
 
 ```text
-Accuracy:     circa 95.53%
-Macro F1:     circa 95.63%
-
-Train rows:   28.355
-Test rows:     6.956
-
-Train cluster: 10.586
-Test cluster:   2.647
-Cluster overlap: 0
+Accuracy
+Macro Precision
+Macro Recall
+Macro F1
 ```
 
-Il valore `cluster_overlap = 0` conferma che non sono presenti cluster contemporaneamente nel training set e nel test set.
+Per la selezione automatica viene utilizzato principalmente il **Macro F1 sul validation set**.
+
+Le metriche finali mostrate dall'applicazione sono invece calcolate sul **test set** dopo il riaddestramento del modello selezionato.
+
+Vengono inoltre registrati:
+
+```text
+Train rows
+Test rows
+Train clusters
+Test clusters
+Cluster overlap
+```
+
+Il valore `cluster_overlap = 0` verifica l'assenza di cluster condivisi tra train e test.
+
+La baseline iniziale basata su Logistic Regression aveva ottenuto circa:
+
+```text
+Accuracy: 95.53%
+Macro F1: 95.63%
+```
+
+Nella versione finale i risultati possono variare in base al modello selezionato automaticamente e sono salvati nel file `training_metrics.json` associato a ogni versione.
 
 ## Struttura principale del progetto
 
@@ -207,7 +274,6 @@ sistemi-distribuiti-ml-pipeline/
 |-- data/
 |   |-- raw/
 |   |   `-- pricerunner_aggregate.csv
-|   |
 |   |-- work/
 |   `-- processed/
 |
@@ -232,19 +298,15 @@ sistemi-distribuiti-ml-pipeline/
 |   |-- preprocessing/
 |   |   |-- main.py
 |   |   `-- function.yaml
-|   |
 |   |-- training/
 |   |   |-- main.py
 |   |   `-- function.yaml
-|   |
 |   |-- status/
 |   |   |-- main.py
 |   |   `-- function.yaml
-|   |
 |   |-- upload/
 |   |   |-- main.py
 |   |   `-- function.yaml
-|   |
 |   `-- inference/
 |       |-- main.py
 |       `-- function.yaml
@@ -320,8 +382,8 @@ docker compose ps
 I servizi principali sono disponibili su:
 
 ```text
-MinIO API:       http://localhost:19000
-MinIO Console:   http://localhost:19001
+MinIO API:        http://localhost:19000
+MinIO Console:    http://localhost:19001
 Nuclio Dashboard: http://localhost:8070
 ```
 
@@ -377,11 +439,16 @@ Il flusso è:
 Upload dataset
 → preprocessing
 → salvataggio dataset processato
-→ training
-→ salvataggio modello e metriche
+→ training dei modelli candidati
+→ selezione automatica
+→ riaddestramento del modello migliore
+→ creazione della nuova versione
+→ aggiornamento di current.json
 ```
 
 L'upload può essere effettuato dalla Console MinIO oppure attraverso `upload-faas`.
+
+Il frontend utilizza `upload-faas` per avviare l'intera pipeline dalla dashboard.
 
 ## Test inference
 
@@ -399,6 +466,17 @@ Invoke-RestMethod `
     -Body $body
 ```
 
+Tra le informazioni restituite sono presenti anche:
+
+```text
+model_version
+algorithm
+cache_hit
+model_load_ms
+```
+
+`cache_hit = false` indica che il modello è stato caricato da MinIO, mentre `cache_hit = true` indica che è stato riutilizzato dalla cache in memoria.
+
 ## Test stato pipeline
 
 ```powershell
@@ -413,7 +491,9 @@ Invoke-RestMethod `
 
 - caricare il dataset;
 - controllare l'avanzamento della pipeline;
-- visualizzare le metriche del training;
+- visualizzare le metriche finali;
+- confrontare i modelli candidati;
+- visualizzare il modello e la versione attivi;
 - effettuare predizioni.
 
 Per utilizzare correttamente il frontend è necessario che Docker e le funzioni Nuclio del backend siano attivi.

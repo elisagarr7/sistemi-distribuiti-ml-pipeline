@@ -11,13 +11,22 @@ from minio import Minio
 import nuclio_sdk
 
 from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.calibration import CalibratedClassifierCV
 from sklearn.linear_model import LogisticRegression
+from sklearn.naive_bayes import MultinomialNB
+from sklearn.svm import LinearSVC
+
 from sklearn.metrics import (
     accuracy_score,
     precision_recall_fscore_support,
 )
 from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
+
+from sklearn.model_selection import (
+    train_test_split,
+    StratifiedGroupKFold,
+)
 
 
 REQUIRED_COLUMNS = {
@@ -183,18 +192,46 @@ def split_by_cluster(
     return train_df, test_df
 
 
-def train_model(df):
-    validate_dataframe(df)
+def build_classifier(
+    algorithm_name,
+    calibration_cv=None,
+):
+    if algorithm_name == "LogisticRegression":
+        return LogisticRegression(
+            max_iter=1000
+        )
 
-    train_df, test_df = split_by_cluster(df)
+    if algorithm_name == "MultinomialNB":
+        return MultinomialNB(
+            alpha=1.0
+        )
 
-    X_train = train_df["product_title"]
-    y_train = train_df["category_label"]
+    if algorithm_name == "LinearSVM":
+        return CalibratedClassifierCV(
+            LinearSVC(
+                C=1.0,
+                random_state=42,
+            ),
+            method="sigmoid",
+            cv=calibration_cv,
+            ensemble=False,
+        )
 
-    X_test = test_df["product_title"]
-    y_test = test_df["category_label"]
+    raise ValueError(
+        f"Algoritmo non supportato: {algorithm_name}"
+    )
 
-    model = Pipeline(
+
+def build_pipeline(
+    algorithm_name,
+    calibration_cv=None,
+):
+    classifier = build_classifier(
+        algorithm_name,
+        calibration_cv,
+    )
+
+    return Pipeline(
         steps=[
             (
                 "tfidf",
@@ -202,19 +239,261 @@ def train_model(df):
             ),
             (
                 "classifier",
-                LogisticRegression(
-                    max_iter=1000
-                )
+                classifier
             ),
         ]
     )
 
-    model.fit(
-        X_train,
-        y_train
+
+def train_model(df):
+    validate_dataframe(df)
+
+    # ==========================================
+    # 1. Split principale TRAIN / TEST
+    # ==========================================
+
+    train_df, test_df = split_by_cluster(df)
+
+    # Il test set viene tenuto completamente
+    # fuori dalla selezione del modello.
+
+
+    # ==========================================
+    # 2. Split TRAIN / VALIDATION
+    # ==========================================
+
+    candidate_train_df, validation_df = (
+        split_by_cluster(
+            train_df,
+            test_size=0.20,
+            random_state=42,
+        )
     )
 
-    predictions = model.predict(
+
+    # ==========================================
+    # 3. Dati per la selezione dei candidati
+    # ==========================================
+
+    X_candidate = candidate_train_df[
+        "product_title"
+    ]
+
+    y_candidate = candidate_train_df[
+        "category_label"
+    ]
+
+    candidate_groups = candidate_train_df[
+        "cluster_id"
+    ]
+
+    X_validation = validation_df[
+        "product_title"
+    ]
+
+    y_validation = validation_df[
+        "category_label"
+    ]
+
+
+    # ==========================================
+    # 4. Fold per calibrazione Linear SVM
+    # ==========================================
+
+    calibration_splitter = StratifiedGroupKFold(
+        n_splits=3,
+        shuffle=True,
+        random_state=42,
+    )
+
+    candidate_calibration_cv = list(
+        calibration_splitter.split(
+            X_candidate,
+            y_candidate,
+            groups=candidate_groups,
+        )
+    )
+
+
+    # ==========================================
+    # 5. Algoritmi candidati
+    # ==========================================
+
+    candidate_algorithms = [
+        "LogisticRegression",
+        "MultinomialNB",
+        "LinearSVM",
+    ]
+
+    candidate_results = []
+
+    best_algorithm = None
+    best_macro_f1 = -1.0
+    best_accuracy = -1.0
+
+
+    # ==========================================
+    # 6. Training e confronto dei candidati
+    # ==========================================
+
+    for algorithm_name in candidate_algorithms:
+
+        calibration_cv = (
+            candidate_calibration_cv
+            if algorithm_name == "LinearSVM"
+            else None
+        )
+
+        candidate_model = build_pipeline(
+            algorithm_name,
+            calibration_cv,
+        )
+
+        candidate_model.fit(
+            X_candidate,
+            y_candidate,
+        )
+
+        validation_predictions = (
+            candidate_model.predict(
+                X_validation
+            )
+        )
+
+        accuracy = accuracy_score(
+            y_validation,
+            validation_predictions,
+        )
+
+        precision, recall, f1, _ = (
+            precision_recall_fscore_support(
+                y_validation,
+                validation_predictions,
+                average="macro",
+                zero_division=0,
+            )
+        )
+
+        result = {
+            "algorithm": algorithm_name,
+            "accuracy": float(accuracy),
+            "macro_precision": float(precision),
+            "macro_recall": float(recall),
+            "macro_f1": float(f1),
+        }
+
+        candidate_results.append(
+            result
+        )
+
+
+        # ======================================
+        # 7. Controllo miglior candidato
+        # ======================================
+
+        is_better = (
+            f1 > best_macro_f1
+            or (
+                f1 == best_macro_f1
+                and accuracy > best_accuracy
+            )
+        )
+
+        if is_better:
+            best_algorithm = algorithm_name
+            best_macro_f1 = float(f1)
+            best_accuracy = float(accuracy)
+
+
+    if best_algorithm is None:
+        raise RuntimeError(
+            "Nessun modello candidato "
+            "è stato selezionato"
+        )
+
+
+    # ==========================================
+    # 8. Ordina risultati e marca vincitore
+    # ==========================================
+
+    candidate_results.sort(
+        key=lambda item: (
+            item["macro_f1"],
+            item["accuracy"],
+        ),
+        reverse=True,
+    )
+
+    for result in candidate_results:
+        result["selected"] = (
+            result["algorithm"]
+            == best_algorithm
+        )
+
+
+    # ==========================================
+    # 9. Training definitivo del vincitore
+    #    sull'intero TRAIN originale
+    # ==========================================
+
+    X_train = train_df[
+        "product_title"
+    ]
+
+    y_train = train_df[
+        "category_label"
+    ]
+
+    train_groups = train_df[
+        "cluster_id"
+    ]
+
+
+    final_calibration_cv = None
+
+    if best_algorithm == "LinearSVM":
+
+        final_calibration_splitter = (
+            StratifiedGroupKFold(
+                n_splits=3,
+                shuffle=True,
+                random_state=42,
+            )
+        )
+
+        final_calibration_cv = list(
+            final_calibration_splitter.split(
+                X_train,
+                y_train,
+                groups=train_groups,
+            )
+        )
+
+
+    best_model = build_pipeline(
+        best_algorithm,
+        final_calibration_cv,
+    )
+
+    best_model.fit(
+        X_train,
+        y_train,
+    )
+
+
+    # ==========================================
+    # 10. Valutazione finale sul TEST
+    # ==========================================
+
+    X_test = test_df[
+        "product_title"
+    ]
+
+    y_test = test_df[
+        "category_label"
+    ]
+
+    predictions = best_model.predict(
         X_test
     )
 
@@ -228,31 +507,88 @@ def train_model(df):
             y_test,
             predictions,
             average="macro",
-            zero_division=0
+            zero_division=0,
         )
     )
 
+
+    # ==========================================
+    # 11. Metriche finali
+    # ==========================================
+
     metrics = {
         "input_rows": int(len(df)),
-        "train_rows": int(len(train_df)),
-        "test_rows": int(len(test_df)),
+
+        "train_rows": int(
+            len(train_df)
+        ),
+
+        "test_rows": int(
+            len(test_df)
+        ),
+
         "train_clusters": int(
-            train_df["cluster_id"].nunique()
+            train_df[
+                "cluster_id"
+            ].nunique()
         ),
+
         "test_clusters": int(
-            test_df["cluster_id"].nunique()
+            test_df[
+                "cluster_id"
+            ].nunique()
         ),
+
         "cluster_overlap": 0,
-        "accuracy": float(accuracy),
-        "macro_precision": float(precision),
-        "macro_recall": float(recall),
-        "macro_f1": float(f1),
-        "num_classes": int(
-            df["category_label"].nunique()
+
+        "accuracy": float(
+            accuracy
         ),
+
+        "macro_precision": float(
+            precision
+        ),
+
+        "macro_recall": float(
+            recall
+        ),
+
+        "macro_f1": float(
+            f1
+        ),
+
+        "num_classes": int(
+            df[
+                "category_label"
+            ].nunique()
+        ),
+
+        "algorithm": best_algorithm,
+
+        "selection": {
+            "metric": "macro_f1",
+
+            "candidate_train_rows": int(
+                len(candidate_train_df)
+            ),
+
+            "validation_rows": int(
+                len(validation_df)
+            ),
+
+            "validation_clusters": int(
+                validation_df[
+                    "cluster_id"
+                ].nunique()
+            ),
+
+            "candidate_models": (
+                candidate_results
+            ),
+        },
     }
 
-    return model, metrics
+    return best_model, metrics
 
 
 def handler(
@@ -267,8 +603,7 @@ def handler(
         )
 
         models_bucket = "models"
-        model_object = "product_classifier.joblib"
-        metrics_object = "training_metrics.json"
+        
 
         context.logger.info_with(
             "Training started",
@@ -317,17 +652,9 @@ def handler(
         model_bytes = model_buffer.getvalue()
 
         # 5. Upload modello
-        client.put_object(
-            bucket_name=models_bucket,
-            object_name=model_object,
-            data=io.BytesIO(model_bytes),
-            length=len(model_bytes),
-            content_type="application/octet-stream"
-        )
-
+ 
         metrics["model_version"] = version_id
         metrics["trained_at"] = trained_at
-        metrics["algorithm"] = "LogisticRegression"
 
         # 6. Serializzazione metriche
         metrics_bytes = json.dumps(
@@ -346,13 +673,6 @@ def handler(
         )
 
         # 7. Upload metriche
-        client.put_object(
-            bucket_name=models_bucket,
-            object_name=metrics_object,
-            data=io.BytesIO(metrics_bytes),
-            length=len(metrics_bytes),
-            content_type="application/json"
-        )
 
         context.logger.info_with(
             "Training completed",
@@ -382,7 +702,7 @@ def handler(
         current_model = {
             "active_version": version_id,
             "created_at": trained_at,
-            "algorithm": "LogisticRegression",
+            "algorithm": metrics["algorithm"],
             "model_object": version_model_object,
             "metrics_object": version_metrics_object,
         }
@@ -407,7 +727,7 @@ def handler(
         context.logger.info_with(
             "Model version created",
             model_version=version_id,
-            algorithm="LogisticRegression",
+            algorithm=metrics["algorithm"],
             model_object=version_model_object,
         )
 

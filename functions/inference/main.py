@@ -3,6 +3,9 @@ import json
 import os
 import re
 
+import threading
+import time
+
 import joblib
 import nuclio_sdk
 
@@ -10,6 +13,12 @@ from minio import Minio
 
 
 MODELS_BUCKET = "models"
+
+_CACHED_MODEL = None
+_CACHED_VERSION = None
+_CACHED_ALGORITHM = None
+
+_CACHE_LOCK = threading.Lock()
 
 def read_json_object(client, bucket_name, object_name):
     response = None
@@ -84,12 +93,24 @@ def normalize_title(title):
 
 def load_model():
     """
-    Recupera il modello serializzato da MinIO
-    e lo deserializza in memoria.
+    Recupera il modello attivo.
+
+    Se la versione è già presente in cache,
+    riutilizza il modello in memoria.
+
+    Se current.json indica una nuova versione,
+    scarica il nuovo modello da MinIO e aggiorna
+    automaticamente la cache.
     """
+
+    global _CACHED_MODEL
+    global _CACHED_VERSION
+    global _CACHED_ALGORITHM
 
     client = get_minio_client()
 
+    # Leggiamo sempre current.json per sapere
+    # quale versione deve essere attiva.
     current_model = read_json_object(
         client,
         MODELS_BUCKET,
@@ -113,26 +134,73 @@ def load_model():
             "Informazioni del modello attivo non valide"
         )
 
-    model_response = None
+    # ==========================================
+    # CACHE HIT
+    # ==========================================
 
-    try:
-        model_response = client.get_object(
-            "models",
-            model_object,
+    if (
+        _CACHED_MODEL is not None
+        and _CACHED_VERSION == model_version
+        and _CACHED_ALGORITHM == algorithm
+    ):
+        return (
+            _CACHED_MODEL,
+            _CACHED_VERSION,
+            _CACHED_ALGORITHM,
+            True,
         )
 
-        model_bytes = model_response.read()
+    # ==========================================
+    # CACHE MISS / MODELLO AGGIORNATO
+    # ==========================================
 
-    finally:
-        if model_response is not None:
-            model_response.close()
-            model_response.release_conn()
+    with _CACHE_LOCK:
 
-    model = joblib.load(
-        io.BytesIO(model_bytes)
-    )
+        # Ricontrolliamo la cache perché un'altra
+        # richiesta potrebbe averla aggiornata
+        # mentre stavamo aspettando il lock.
+        if (
+            _CACHED_MODEL is not None
+            and _CACHED_VERSION == model_version
+            and _CACHED_ALGORITHM == algorithm
+        ):
+            return (
+                _CACHED_MODEL,
+                _CACHED_VERSION,
+                _CACHED_ALGORITHM,
+                True,
+            )
 
-    return model, model_version, algorithm
+        model_response = None
+
+        try:
+            model_response = client.get_object(
+                MODELS_BUCKET,
+                model_object,
+            )
+
+            model_bytes = model_response.read()
+
+        finally:
+            if model_response is not None:
+                model_response.close()
+                model_response.release_conn()
+
+        model = joblib.load(
+            io.BytesIO(model_bytes)
+        )
+
+        # Aggiornamento della cache
+        _CACHED_MODEL = model
+        _CACHED_VERSION = model_version
+        _CACHED_ALGORITHM = algorithm
+
+        return (
+            _CACHED_MODEL,
+            _CACHED_VERSION,
+            _CACHED_ALGORITHM,
+            False,
+        )
 
 
 def handler(
@@ -185,7 +253,21 @@ def handler(
             product_title=normalized_title
         )
 
-        model, model_version, algorithm = load_model()
+
+        model_load_start = time.perf_counter()
+
+        (
+            model,
+            model_version,
+            algorithm,
+            cache_hit,
+        ) = load_model()
+
+        model_load_ms = (
+            time.perf_counter() - model_load_start
+        ) * 1000
+
+
 
         predicted_category = model.predict(
             [normalized_title]
@@ -214,7 +296,13 @@ def handler(
         context.logger.info_with(
             "Inference completed",
             predicted_category=predicted_category,
-            confidence=confidence
+            confidence=confidence,
+            model_version=model_version,
+            cache_hit=cache_hit,
+            model_load_ms=round(
+                model_load_ms,
+                2
+            ),
         )
 
         return context.Response(
@@ -231,6 +319,11 @@ def handler(
                     "confidence": confidence,
                     "model_version": model_version,
                     "algorithm": algorithm,
+                    "cache_hit": cache_hit,
+                    "model_load_ms": round(
+                        model_load_ms,
+                        2
+                    ),
                 }
             ),
             headers={},
